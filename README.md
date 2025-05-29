@@ -1,17 +1,9 @@
 # topic-modelling-protest-rhetoric
 
-Analysing UK parliamentary debates on protest using structural topic modelling
+**Analysing UK parliamentary debates on protest using structural topic modelling**
 
-This project is for analyzing protest rhetoric using topic modelling in R. It was originally developed in R Studio and is now being prepared for GitHub.
+This project explores the latent themes that have run through politicians’ speeches about protest in the UK House of Commons over the last 50 years. The transcripts from any debates discussing protest, and from changes to legislation covering protest, are analysed using topic modelling via the stm package in R. Through uncovering the latent patterns and themes in parliamentary discourse, I seek to understand the ways in which politicians have framed protest and police power in the UK. In doing so, I answer the following questions:
 
-## Getting Started
-- Open this folder in VS Code.
-- Add your R scripts and data files here.
-- Use Git to manage version control.
+1. What latent themes lie underneath politicians’ discussion of political protest in House of Commons debates?
 
-## Requirements
-- R (install from https://cran.r-project.org/)
-- Recommended: VS Code R extension for enhanced support.
-
-## Usage
-Add your R scripts and run them as needed. Update this README as you migrate your project.
+2. How does party affiliation affect politicians’ framing of political protest?
