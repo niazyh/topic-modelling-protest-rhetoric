@@ -1,0 +1,641 @@
+---
+title: 'KillTheBill- Evaluating UK parliamentary debates on protest with structural
+  topic modelling'
+output:
+  word_document: default
+  html_notebook: default
+---
+
+Calling packages
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(stringr)
+library(tidyverse)
+library(tidytext)
+library(quanteda)
+library(stm)
+library(readtext)
+library(furrr)
+library(formattable)
+library(reshape2)
+library(tm)
+library(ggplot2)
+library(forcats)
+library(igraph)
+library(ggraph)
+library(widyr)
+library(ggrepel)
+library(topicmodels)
+library(corpustools)
+library(tibble)
+library(vctrs)
+library(devtools)
+library(Rtsne)
+library(geometry)
+library(rsvd)
+library(stmCorrViz)
+```
+
+Reading in files and creating raw text tibble
+
+```{r}
+# add debates to a folder, with sub-folders by year
+debate_folder <- "debates"
+
+# define a function to read all files from a folder into a data frame
+read_folder <- function(infolder) {
+  tibble(file = dir(infolder, full.names = TRUE)) %>%
+    mutate(text = map(file, read_lines)) %>%
+    transmute(debate = basename(file), text) %>%
+    unnest(text)
+}
+
+# use unnest() and map() to apply read_folder to each subfolder
+raw_text <- tibble(folder = dir(debate_folder, full.names = TRUE)) %>%
+  mutate(folder_out = map(folder, read_folder)) %>%
+  unnest(cols = c(folder_out)) %>%
+  transmute(year = basename(folder), debate, text)
+```
+
+Extracting metadata from raw text and adding to data.frame; cleaning data.frame
+
+```{r}
+# taking out hyphens from names
+raw_text[] <- lapply(raw_text, gsub, pattern='-', replacement='') 
+
+# detecting name formats to splice by speech
+prepped_text <- raw_text %>% 
+  mutate(linenumber = row_number(),
+         speech = cumsum(str_detect(text, 
+                                     regex("^[M](.*?)[.] [[:upper:]](.*?) [[:upper:]](.*?) [(](.*?)[)] [(](.*?)[)]$|^[[:upper:]](.*?) [[:upper:]](.*?) [(](.*?)[)] [(](.*?)[)]$"))))
+
+# select by first line (speaker name), and then extract the party from the name
+speakers <- prepped_text %>%
+  group_by(speech) %>%
+  slice(1) %>%
+  select(-linenumber) %>%
+  rename(speaker = text) %>%
+  mutate(speaker = str_remove(speaker, " \\[V\\]"),
+         party = str_extract(speaker, "(?<=\\()[A-z]*(?=\\)$)"),
+         plain_name = str_remove(speaker, "\\(.*\\)"))
+
+# add the speaker and party to the dataframe
+prepped_text <- prepped_text %>% left_join(speakers, by = c("speech" = "speech"))
+
+# tidying new prepped_text tibble
+prepped_text <- prepped_text %>%
+  select(-year.y, -debate.y)
+
+# ensuring all columns are classed correctly
+prepped_text$year.x <- as.integer(as.character(prepped_text$year.x))
+
+# replacing missing values
+prepped_text <- prepped_text %>%
+  mutate(party = replace(party, is.na(party), "none"))
+
+# now that speaker and party have been extracted, taking them out of the main text
+prepped_text$text<-str_remove(prepped_text$text, regex("^[M](.*?)[.] [[:upper:]](.*?) [[:upper:]](.*?) [(](.*?)[)] [(](.*?)[)]$|^[[:upper:]](.*?) [[:upper:]](.*?) [(](.*?)[)] [(](.*?)[)]$"))
+
+# removing times
+prepped_text$text<-str_remove(prepped_text$text, regex("^[[:digit:]][[:digit:]][:][[:digit:]][[:digit:]][:][[:digit:]][[:digit:]]$|^[[:digit:]][.][[:digit:]][[:digit:]][ ][[:lower:]][.][[:lower:]][.]$|^[[:digit:]][.][[:digit:]][[:digit:]][ ][[:lower:]][[:lower:]]$|^[[:digit:]][[:digit:]][.][[:digit:]][[:digit:]][ ][[:lower:]][[:lower:]]$"))
+
+# removing empty rows
+prepped_text <- prepped_text[!(prepped_text$text == "" | is.na(prepped_text$text)), ]
+prepped_text <- prepped_text[!(prepped_text$text == " " | is.na(prepped_text$text)), ]
+prepped_text <- prepped_text[!(prepped_text$text == "  " | is.na(prepped_text$text)), ]
+
+# adding row ID
+prepped_text <- tibble::rowid_to_column(prepped_text, "rowID")
+```
+
+Preparing for stm() input: tokenising and stopwords
+
+```{r}
+# creating corpus from prepped_text including docvars
+pro_corpus <- corpus(
+  prepped_text,
+  docid_field = "rowID",
+  text_field = "text",
+  meta = list("year.x", "debate.x", "linenumber", "speech", "speaker", "party", "plain_name"),
+  )
+
+# preparing for stm piped into one command
+stm_input <- pro_corpus %>%
+  tokens(remove_numbers = TRUE, remove_punct = TRUE, remove_symbols = TRUE, include_docvars = TRUE) %>%
+  tokens_tolower() %>%
+  tokens_remove(pattern = c(stopwords("english"), "con", "lab", "one", "house", "hon", "honourable", "right", "gentleman", "bill", "government", "bill", "mr", "member", "secretary", "speaker", "home", "prime", "minister", "friend", "will", "say", "said", "also", "may", "priti", "patel", "give", "way", "amendment", "clause", "maiden", "speech", "ms", "constituency", "members", "friend")) %>%
+  tokens_wordstem() %>%
+  dfm() %>%
+  convert(to = "stm")
+
+# setting documents, vocab and metadata for stm
+docs <- stm_input$documents
+vocab <- stm_input$vocab
+meta <-stm_input$meta
+```
+
+Running diagnostics to decide on the number of topics
+
+```{r}
+# run diagnostics to search for best number for K
+storage1 <- searchK(docs, 
+                    vocab, 
+                    K = c(5,10,15,20,50), 
+                    prevalence =~ party + s(year.x), 
+                    data=meta,
+                    set.seed(9999), 
+                    verbose=TRUE
+                    )
+
+# plot these results for inspection
+print(storage1$results)
+options(repr.plot.width=6, repr.plot.height=6)
+plot(storage1)
+
+# run models for 12, 15, 17 and 20 topics
+model12<-stm(docs, 
+             vocab, 
+             prevalence =~ party + s(year.x), 
+             K=12, 
+             data=meta, 
+             init.type = "Spectral", 
+             verbose=TRUE
+             )
+
+model15<-stm(docs,
+             vocab, 
+             prevalence =~ party + s(year.x), 
+             K=15, 
+             data=meta, 
+             init.type = "Spectral", 
+             verbose=TRUE
+             )
+
+model17<-stm(docs,
+             vocab, 
+             prevalence =~ party + s(year.x), 
+             K=17, 
+             data=meta, 
+             init.type = "Spectral", 
+             verbose=TRUE
+             )
+
+model20<-stm(docs,
+             vocab, 
+             prevalence =~ party + s(year.x), 
+             K=20, 
+             data=meta, 
+             init.type = "Spectral", 
+             verbose=TRUE
+             )
+
+# plot these 3 models to compare semantic coherence and exclusivity and select best model
+suppressWarnings(library(ggplot2))
+suppressWarnings(library(plotly))
+
+M12ExSem<-as.data.frame(cbind(c(1:12),
+                              exclusivity(model12), 
+                              semanticCoherence(model=model12, docs), 
+                              "Mod12")
+                        )
+
+M15ExSem<-as.data.frame(cbind(c(1:15),
+                              exclusivity(model15), 
+                              semanticCoherence(model=model15, docs), 
+                              "Mod15")
+                        )
+
+M17ExSem<-as.data.frame(cbind(c(1:17),
+                              exclusivity(model17), 
+                              semanticCoherence(model=model17, docs), 
+                              "Mod17")
+                        )
+
+M20ExSem<-as.data.frame(cbind(c(1:20),
+                              exclusivity(model20), 
+                              semanticCoherence(model=model20, docs), 
+                              "Mod20")
+                        )
+
+ModsExSem<-rbind(M12ExSem, M15ExSem, M17ExSem, M20ExSem)
+
+colnames(ModsExSem)<-c("K","Exclusivity", "SemanticCoherence", "Model")
+
+ModsExSem$Exclusivity<-as.numeric(as.character(ModsExSem$Exclusivity))
+ModsExSem$SemanticCoherence<-as.numeric(as.character(ModsExSem$SemanticCoherence))
+
+options(repr.plot.width=7, repr.plot.height=7, repr.plot.res=100)
+
+plotexcoer<-ggplot(ModsExSem, aes(SemanticCoherence, Exclusivity, color = Model))+geom_point(size = 2, alpha = 0.7) + 
+geom_text(aes(label=K), nudge_x=.05, nudge_y=.05)+
+  labs(x = "Semantic coherence",
+       y = "Exclusivity",
+       title = "Comparing exclusivity and semantic coherence")
+
+plotexcoer
+```
+
+Plotting selected structural topic model
+
+```{r}
+
+# plot the selected model 
+plot(
+  model12,
+  type = "summary",
+  n = 15,
+  text.cex = 0.5,
+  main = "STM topic shares",
+  xlab = "Share estimation"
+)
+
+# plot word clouds for each topic 
+par(mar=c(0.5, 0.5, 0.5, 0.5))
+cloud(model12, topic = 7, scale = c(2.25,.5))
+
+# or more simply
+cloud(model12, topic = 7)
+```
+
+Plotting the topics using Tidyverse
+
+```{r}
+# plot overall tidy graphic showing beta scores for each topic
+td_beta <- tidytext::tidy(model12) 
+
+td_beta %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+ ungroup() %>%
+    mutate(topic = paste0("Topic ", topic),
+         term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = as.factor(topic))) +
+  geom_col(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free_y") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(x = NULL, y = expression(beta),
+       title = "Topics Identified in the Debates Corpus",
+       subtitle = "Words are linked to specific topics accordingly with their beta probabilities of belonging to that topic")
+
+# more detailed look at words associated with each topic
+
+# beta values for topic [1]
+betaT1<-td_beta %>%
+  mutate(topic = paste0("Topic ", topic),
+         term = reorder_within(term, beta, topic)) %>%filter(topic=="Topic 1")
+
+# plot word probabilities higher than 0.003 for topic [1]
+betaplotT1 <- ggplot(betaT1[betaT1$beta>0.003,], aes(term, beta, fill = as.factor(topic))) +
+  geom_bar(alpha = 0.8, show.legend = FALSE, stat = "Identity")+coord_flip()+labs(x ="Terms", y = expression(beta),
+       title = "Word probabilities for Topic 1")
+
+betaplotT1
+```
+
+Understanding the topics using summary visualisations and quoted documents
+
+```{r}
+# prints several different types of word profiles, including highest probability words and FREX words (FREX weights words by their overall frequency and how exclusive they are to the topic)
+labelTopics(model12, n=15, c(11))
+
+# plots this
+plot.STM(model12, type = "labels", topics = c(12), label="frex", n=10, width=500)
+
+# summary plots
+plot(model12, type = "summary", labeltype = c("frex"))
+plot(model12, type = "hist", labeltype = c("frex"))
+plot(model12, type = "labels", labeltype = c("frex"))
+cloud(model12, topic = 1)
+
+# create a data.frame with dropped rows removed to match the number of documents in stm object
+prepped_text_dropped_rows = prepped_text[-c(24, 115, 116, 119, 140, 264, 327, 344, 409, 415, 423, 427, 429, 430, 431, 434, 435, 436, 774, 945, 979, 1204, 1250, 1257, 1429, 1440, 1463, 1484, 1486, 1489, 1513, 1670, 1690, 1706, 1724, 1759, 2311, 2678, 2692, 2698, 2704, 2706, 2708, 2716, 3055, 3371, 3496, 3504, 3541, 3552, 3644, 4362, 4437, 4462, 4601, 4602, 5240, 5244),]
+
+# show a set number of quotations from a specified [topic]
+thoughts1 <- findThoughts(model12, prepped_text_dropped_rows$text, topics=1, n=7)$docs[[1]]
+
+# plot the above
+plotQuote(thoughts1, width=150, text.cex=1, maxwidth=500, main="Topic 1")
+
+# plot the topics in clusters on an interactive web page
+stmCorrViz(model12, "corrviz.html", documents_raw=prepped_text_dropped_rows$text, documents_matrix=stm_input$documents)
+```
+
+Analysis with party as prevalence covariate
+
+```{r}
+# bring in party as prevalence covariate and estimate effect on specified topics [1:12]
+prep <- estimateEffect(
+  1:12 ~ party + s(year.x), 
+  model12,
+  meta = meta,
+  uncertainty = "Global"
+  )
+
+summary(prep, topics = 12)
+
+# plot this
+plot(
+  prep, 
+  covariate = "party", 
+  topics = c(1:12),
+  model = model12, 
+  method = "difference",
+  cov.value1 = "Lab",
+  cov.value2 = "Con",
+  xlab = "More Labour ... More Conservative",
+  main = "Estimated Topic Proportion by Major Political Party", 
+  xlim = c(-0.05, 0.07),
+  labeltype = "custom"
+  )
+```
+
+Analysis with year as second prevalence covariate
+
+```{r}
+# create a year sequence to put along the bottom axis
+yearseq <- seq(from = as.Date("1970-01-01"), to = as.Date("2021-05-01"), by = "year")
+
+# plot how topic(s) prevalence changes over time
+plot(
+  prep, 
+  covariate = "year.x",
+  method = "continuous", 
+  topics = c(1:12),
+  model = z, 
+  printlegend = FALSE, 
+  xaxt = "n", 
+  xlab = "Year"
+  )
+
+axis(1,at = as.numeric(yearseq) - min(as.numeric(yearseq)), labels = yearseq)
+seq <- seq(from = as.numeric("1970"), to = as.numeric("2021"))
+axis(1, at = seq)
+title("Topics relating to strikes and trade unions")
+abline(h=0, col="blue")
+```
+
+Analysis with party as topical content covariate
+
+```{r}
+# topical content variable allows for the vocabulary used to talk about a particular topic to vary.
+content <- stm(
+  docs, 
+  vocab, 
+  K = 20,
+  prevalence =~ party + s(year.x), 
+  content =~ party,
+  data = meta, 
+  init.type = "Spectral",
+  max.em.its = 75,
+  verbose = TRUE
+  )
+
+# plot new topics
+plot(
+  content,
+  type = "summary",
+  n = 15,
+  text.cex = 0.8,
+  main = "STM topic shares",
+  xlab = "Share estimation"
+)
+
+# wordclouds and summaries for each topic 
+cloud(content, topic = 8)
+sageLabels(content, n = c(12))
+
+# plot quotes
+content_thoughts3 <- findThoughts(content, prepped_text_dropped_rows$text, topics=3, n=6)$docs[[1]]
+plotQuote(content_thoughts3, width=150, text.cex=1, maxwidth=500, main="Content Topic 3")
+
+# analyse by party
+plot(content, type = "perspectives", n = 40, text.cex=1.2, topics = 6, covarlevels = c("Con", "Lab"))
+```
+
+
+** Additional Descriptive Analyses
+
+Word frequencies, specifically by party
+
+```{r Word Frequencies}
+# using unnest function to convert to one word per row tibble + finding number of words spoken by each party
+
+protest_words <- prepped_text %>%
+  unnest_tokens(word, text) %>%
+  count(party, word, sort = TRUE)
+
+total_words <- protest_words %>% 
+  group_by(party) %>% 
+  summarize(total = sum(n))
+
+protest_words <- left_join(protest_words, total_words)
+
+# removing the same stop words
+
+mystopwords <- tibble(word = c("con", "lab", "one", "house", "hon", "honourable", "right", "gentleman", "bill", "government", "bill", "mr", "member", "secretary", "speaker", "home", "prime", "minister", "friend", "will", "say", "said", "also", "may", "priti", "patel", "give", "way", "amendment", "clause", "maiden", "speech", "ms", "constituency", "members", "friend"))
+
+protest_words <- anti_join(protest_words, stop_words, mystopwords, 
+                           by = "word")
+
+# plots the words most commonly used by each party
+
+plot_protest <- protest_words %>%
+  bind_tf_idf(word, party, n) %>%
+  mutate(word = str_remove_all(word, "_")) %>%
+  group_by(party) %>% 
+  slice_max(tf_idf, n = 15) %>%
+  ungroup() %>%
+  mutate(word = reorder_within(word, tf_idf, party)) %>%
+  mutate(party = factor(party, levels = c("Lab", "Con", "LD"), exclude = c("PC", "SNP", "Green", "none", NA)))
+
+ggplot(plot_protest, aes(word, tf_idf, fill = party)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~party, ncol = 2, scales = "free") +
+  coord_flip() +
+  scale_x_reordered()
+
+# distribution of most common words for each party
+
+ggplot(protest_words, aes(n/total, fill = party)) +
+  geom_histogram(show.legend = FALSE) +
+  xlim(NA, 0.0009) +
+  facet_wrap(~party, ncol = 2, scales = "free_y")
+
+# Zipf's law: rank of each common word by party
+
+freq_by_rank <- protest_words %>% 
+  group_by(party) %>% 
+  mutate(rank = row_number(), 
+         `term frequency` = n/total) %>%
+  ungroup()
+
+freq_by_rank %>% 
+  ggplot(aes(rank, `term frequency`, color = party)) + 
+  geom_line(size = 1.1, alpha = 0.8, show.legend = FALSE) + 
+  scale_x_log10() +
+  scale_y_log10()
+
+# find the important words for the content of each document by decreasing the weight for commonly used words and increasing the weight for words that are not used very much in the whole corpus of documents
+
+protest_tf_idf <- protest_words %>%
+  bind_tf_idf(word, party, n)
+
+protest_tf_idf %>%
+  select(-total) %>%
+  arrange(desc(tf_idf))
+
+protest_tf_idf %>%
+  group_by(party) %>%
+  slice_max(tf_idf, n = 21) %>%
+  ungroup() %>%
+  filter(party == c("Con", "Lab", "LD")) %>%
+  ggplot(aes(tf_idf, fct_reorder(word, tf_idf), fill = party)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~party, ncol = 2, scales = "free") +
+  labs(x = "tf-idf", y = NULL)
+```
+
+n grams and correlations: finding what words frequently get used together
+
+```{r}
+# breaking into 2 word chunks
+
+protest_bigrams <- prepped_text %>%
+  unnest_tokens(bigram, text, token = "ngrams", n = 2)
+
+# finding most common bigrams
+
+protest_bigrams %>%
+  count(bigram, sort = TRUE)
+
+# taking out stop words
+
+bigrams_separated <- protest_bigrams %>%
+  separate(bigram, c("word1", "word2"), sep = " ")
+
+bigrams_filtered <- bigrams_separated %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word)
+
+# new bigram counts:
+
+bigram_counts <- bigrams_filtered %>% 
+  count(word1, word2, sort = TRUE)
+
+# recombined words after filtering out stop words 
+
+bigrams_united <- bigrams_filtered %>%
+  unite(bigram, word1, word2, sep = " ")
+
+# use to see what words frequently get used alongside a [particular word], by party/year
+
+bigrams_filtered %>%
+  filter(word2 == "strike") %>%
+  count(party, word1, sort = TRUE)
+
+bigram_tf_idf <- bigrams_united %>%
+  count(party, bigram) %>%
+  bind_tf_idf(bigram, party, n) %>%
+  arrange(desc(tf_idf))
+
+bigram_tf_idf %>%
+  group_by(party) %>%
+  slice_max(tf_idf, n = 10) %>%
+  ungroup()
+```
+
+Visualising bigram networks
+
+```{r}
+set.seed(2017)
+
+bigram_graph <- bigram_counts %>%
+  filter(n > 20) %>%
+  graph_from_data_frame()
+
+bigram_graph
+
+# makes visualisation of bigram networks
+
+ggraph(bigram_graph, layout = "fr") +
+  geom_edge_link() +
+  geom_node_point() +
+  geom_node_text(aes(label = name), vjust = 1, hjust = 1)
+
+# more complex visualisation options
+
+set.seed(2020)
+
+a <- grid::arrow(type = "closed", length = unit(.15, "inches"))
+
+ggraph(bigram_graph, layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n), show.legend = FALSE,
+                 arrow = a, end_cap = circle(.07, 'inches')) +
+  geom_node_point(color = "lightblue", size = 5) +
+  geom_node_text(aes(label = name), vjust = 1, hjust = 1) +
+  theme_void()
+```
+
+Complex bigram/trigram network visualisations using filters 
+
+```{r}
+# cuts the tibble down into 10 rows at a time, and filters by year
+
+protest_section_words <- prepped_text %>%
+  filter(party == "Lab") %>%
+  mutate(section = row_number() %/% 10) %>%
+  filter(section > 0) %>%
+  unnest_tokens(word, text) %>%
+  filter(!word %in% stop_words$word)
+
+# count words co-occuring within sections
+
+word_pairs <- protest_section_words %>%
+  pairwise_count(word, section, sort = TRUE)
+
+# search for most common pairing words with a [given word]
+
+word_pairs %>%
+  filter(item1 == "traveller")
+
+# Uses the phi coefficient based on how often words co-appear in a given section
+
+word_cors <- protest_section_words %>%
+  group_by(word) %>%
+  filter(n() >= 20) %>%
+  pairwise_cor(word, section, sort = TRUE)
+
+# gives graphs to show pairings with the highest coefficients when you input [certain words]
+
+word_cors %>%
+  filter(item1 %in% c("disorder", "demonstration", "protesters")) %>%
+  group_by(item1) %>%
+  slice_max(correlation, n = 12) %>%
+  ungroup() %>%
+  mutate(item2 = reorder(item2, correlation)) %>%
+  ggplot(aes(item2, correlation)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ item1, scales = "free") +
+  coord_flip()
+
+# puts this into a network visualisation 
+
+set.seed(2016)
+
+word_cors %>%
+  filter(correlation > .75) %>%
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = correlation), show.legend = FALSE) +
+  geom_node_point(color = "lightblue", size = 5) +
+  geom_node_text(aes(label = name), repel = TRUE,
+  max.overlaps = getOption("ggrepel.max.overlaps", default = 500)) +
+  theme_void()
+
+```
